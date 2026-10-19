@@ -53,3 +53,59 @@ sudo ./omv-pool.sh lock
 - **Never hardcode `/dev/sdX` paths**: Drive letters can shift across reboots; always resolve from `/dev/disk/by-uuid/`.
 - **Safe unmounting**: Always tear down in reverse dependency order (`SMB/NFS services` -> `/export/* bind mounts` -> `MergerFS` -> `ext4` -> `sync` -> `cryptsetup close`) and report active processes with `fuser -vm` if any mount point is busy.
 - **Passphrase handling**: Never pass LUKS passphrases as command-line arguments (`ps`-visible); always pipe via `stdin` (`printf '%s' "$luks_pass" | cryptsetup open ... -`) and `unset` immediately after use.
+
+---
+
+## Future Roadmap: Packaging as an OMV 8 Plugin (`openmediavault-lukspool`)
+
+When ready to package `omv-pool.sh` as a native OMV 8 `.deb` plugin, use OMV's declarative Workbench YAML frontend and PHP RPC backend:
+
+### 1. Package Layout
+```text
+openmediavault-lukspool/
+├── debian/
+│   ├── control
+│   ├── install
+│   └── postinst
+└── usr/
+    ├── sbin/
+    │   └── omv-pool.sh
+    └── share/openmediavault/
+        ├── engined/rpc/
+        │   └── lukspool.inc
+        └── workbench/
+            ├── navigation.d/
+            │   └── storage.lukspool.yaml
+            ├── route.d/
+            │   └── storage.lukspool.yaml
+            └── component.d/
+                └── omv-storage-lukspool-page.yaml
+```
+
+### 2. Backend RPC (`usr/share/openmediavault/engined/rpc/lukspool.inc`)
+- Define `OMVRpcServiceLuksPool extends \OMV\Rpc\ServiceAbstract` under `namespace Engined\Rpc`.
+- Register RPC methods:
+  - `getStatus`: runs `/usr/sbin/omv-pool.sh status` and returns `["statusText" => ...]`.
+  - `configure`: runs `/usr/sbin/omv-pool.sh config <poolName>`.
+  - `unlock`: spawns `/usr/sbin/omv-pool.sh unlock` via `proc_open()` and writes `$params['passphrase'] . "\n"` to `stdin` pipe `0` (update `omv-pool.sh` to support non-TTY stdin via `if [[ -t 0 ]]; then read -rsp ...; else read -r ...; fi`).
+  - `lock`: runs `/usr/sbin/omv-pool.sh lock`.
+
+### 3. Workbench UI YAML (`usr/share/openmediavault/workbench/`)
+- **Navigation (`navigation.d/storage.lukspool.yaml`)**: Adds `storage.lukspool` ("LUKS Pool") at `/storage/lukspool`.
+- **Route (`route.d/storage.lukspool.yaml`)**: Maps `/storage/lukspool` to component `omv-storage-lukspool-page`.
+- **Component (`component.d/omv-storage-lukspool-page.yaml`)**:
+  - `formPage` calling `LuksPool.getStatus` into a readonly `textarea` (`statusText`).
+  - **Unlock & Mount** button opening a `formDialog` with a `passwordInput` (`passphrase`) that submits to `LuksPool.unlock`.
+  - **Unmount & Lock** button with `confirmationDialogConfig` that calls `LuksPool.lock`.
+
+### 4. Build & Activation (`debian/postinst`)
+- In `debian/postinst` (`configure` stage), run:
+  ```bash
+  omv-mkworkbench all
+  systemctl restart openmediavault-engined || true
+  ```
+- Build and install with:
+  ```bash
+  dpkg-deb --build openmediavault-lukspool
+  sudo dpkg -i openmediavault-lukspool.deb
+  ```
