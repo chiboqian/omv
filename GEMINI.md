@@ -1,7 +1,7 @@
 # OpenMediaVault 8 LUKS + Ext4 + MergerFS Pool Manager
 
 ## Overview
-This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script for **OpenMediaVault 8 (OMV 8)** that manages a MergerFS pool layered over two `ext4` filesystems on top of two `crypto_LUKS` encrypted drives sharing the same passphrase.
+This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script for **OpenMediaVault 8 (OMV 8)** that manages a MergerFS pool layered over two `ext4` filesystems on top of two `crypto_LUKS` encrypted drives sharing the same passphrase, along with any associated NFS `/export/*` bind mounts and SMB/NFS sharing services.
 
 ---
 
@@ -19,7 +19,13 @@ This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script fo
 3. **MergerFS Layer (`MERGERFS_MOUNT`)**
    - Starts/stops the OMV 8 `openmediavault-mergerfs` systemd mount unit (`srv-mergerfs-<pool>.mount` via `systemd-escape`), restarting the unit if underlying `ext4` mounts were newly mounted after boot.
 
-4. **Configuration (`/etc/omv-pool.conf`)**
+4. **Shared Folders Layer (`EXPORT_MOUNTS` & `SHARE_SERVICES`)**
+   - Automatically discovers `/export/*` NFS bind mounts in `/etc/fstab` backed by the MergerFS pool (or its underlying ext4 mounts), mounting them after MergerFS on `unlock` and unmounting them before MergerFS on `lock`.
+   - Detects enabled OMV file-sharing services (`smbd.service`, `nfs-server.service`) via `systemctl` and `/etc/openmediavault/config.xml`:
+     - On `unlock`: starts or reloads `smbd.service` / `nfs-server.service` after the pool and exports are mounted.
+     - On `lock`: stops `smbd.service` / `nfs-server.service` before unmounting so open SMB/NFS file handles do not block `umount` with `target is busy`.
+
+5. **Configuration (`/etc/omv-pool.conf`)**
    - Generated automatically by inspecting `/etc/systemd/system/srv-mergerfs-*.mount` (or `/etc/openmediavault/config.xml`), `/etc/fstab`, and `lsblk`/`cryptsetup luksUUID`.
    - Stored with `0600` permissions at `/etc/omv-pool.conf`.
 
@@ -31,13 +37,13 @@ This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script fo
 # 1. Generate and save /etc/omv-pool.conf from the MergerFS pool name
 sudo ./omv-pool.sh config <mergerfs-pool-name>
 
-# 2. Unlock both LUKS drives (prompts once) and mount ext4 + MergerFS
+# 2. Unlock both LUKS drives (prompts once), mount ext4 + MergerFS + exports, and start SMB/NFS
 sudo ./omv-pool.sh unlock
 
-# 3. Check current LUKS, ext4, and MergerFS status
+# 3. Check current LUKS, ext4, MergerFS, export bind mount, and SMB/NFS status
 sudo ./omv-pool.sh status
 
-# 4. Unmount MergerFS + ext4 and lock both LUKS drives
+# 4. Stop SMB/NFS, unmount exports + MergerFS + ext4, and lock both LUKS drives
 sudo ./omv-pool.sh lock
 ```
 
@@ -45,5 +51,5 @@ sudo ./omv-pool.sh lock
 
 ## Guardrails for Future Modifications
 - **Never hardcode `/dev/sdX` paths**: Drive letters can shift across reboots; always resolve from `/dev/disk/by-uuid/`.
-- **Safe unmounting**: Always unmount in reverse dependency order (`MergerFS` -> `ext4` -> `sync` -> `cryptsetup close`) and report active processes with `fuser -vm` if any mount point is busy.
+- **Safe unmounting**: Always tear down in reverse dependency order (`SMB/NFS services` -> `/export/* bind mounts` -> `MergerFS` -> `ext4` -> `sync` -> `cryptsetup close`) and report active processes with `fuser -vm` if any mount point is busy.
 - **Passphrase handling**: Never pass LUKS passphrases as command-line arguments (`ps`-visible); always pipe via `stdin` (`printf '%s' "$luks_pass" | cryptsetup open ... -`) and `unset` immediately after use.
