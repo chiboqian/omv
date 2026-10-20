@@ -10,9 +10,10 @@ Usage:
   sudo $(basename "$0") [-n|--dry-run] config <mergerfs-pool-name>   Generate and save $CONFIG_FILE
   sudo $(basename "$0") [-n|--dry-run] unlock                        Unlock LUKS, mount filesystems + MergerFS + exports, and start SMB/NFS
   sudo $(basename "$0") [-n|--dry-run] lock                          Stop SMB/NFS, unmount exports + MergerFS + filesystems, lock LUKS, and restart SMB/NFS
-  sudo $(basename "$0") status                                       Show current LUKS, mount, and SMB/NFS share status
+  sudo $(basename "$0") [-s|--status|status]                         Show current LUKS, mount, and SMB/NFS share status
 
 Options:
+  -s, --status    Show current LUKS, filesystem, MergerFS, export, and SMB/NFS status
   -n, --dry-run   Show what actions would be taken without making any changes
   -h, --help      Show this help message
 EOF
@@ -948,23 +949,32 @@ do_status() {
     load_config
     echo "=== LUKS Drives ==="
     for uuid in "${LUKS_UUIDS[@]}"; do
-        if [[ ! -e "/dev/disk/by-uuid/${uuid}" ]]; then
+        local dev="/dev/disk/by-uuid/${uuid}"
+        if [[ ! -e "$dev" ]]; then
             echo "  [MISSING]  $uuid"
             continue
         fi
-        local mapper
+        local kname label dev_info mapper
+        kname="$(lsblk -ndo KNAME "$dev" 2>/dev/null || true)"
+        label="$(lsblk -ndo LABEL "$dev" 2>/dev/null || true)"
+        dev_info="/dev/${kname:-?}"
+        [[ -n "$label" ]] && dev_info="${dev_info} (${label})"
+
         mapper="$(get_active_mapper "$uuid")"
         if [[ -n "$mapper" ]]; then
-            echo "  [UNLOCKED] $uuid (/dev/mapper/${mapper})"
+            echo "  [UNLOCKED] $uuid -> $dev_info -> /dev/mapper/${mapper}"
         else
-            echo "  [LOCKED]   $uuid"
+            echo "  [LOCKED]   $uuid -> $dev_info"
         fi
     done
 
     echo "=== Filesystem Mounts ==="
     for mnt in "${FS_MOUNTS[@]}"; do
         if mountpoint -q "$mnt"; then
-            echo "  [MOUNTED]   $mnt"
+            local fstype avail="" pcent=""
+            fstype="$(findmnt -rn -o FSTYPE --mountpoint "$mnt" 2>/dev/null | awk 'NR==1{print; exit}' || true)"
+            read -r avail pcent < <(df -h --output=avail,pcent "$mnt" 2>/dev/null | awk 'NR==2{print $1, $2}' || true) || true
+            echo "  [MOUNTED]   $mnt (${fstype:-unknown}, ${avail:-?} avail, ${pcent:-?} used)"
         else
             echo "  [UNMOUNTED] $mnt"
         fi
@@ -972,7 +982,9 @@ do_status() {
 
     echo "=== MergerFS Pool ==="
     if mountpoint -q "$MERGERFS_MOUNT"; then
-        echo "  [MOUNTED]   $MERGERFS_MOUNT"
+        local m_avail="" m_pcent=""
+        read -r m_avail m_pcent < <(df -h --output=avail,pcent "$MERGERFS_MOUNT" 2>/dev/null | awk 'NR==2{print $1, $2}' || true) || true
+        echo "  [MOUNTED]   $MERGERFS_MOUNT (${m_avail:-?} avail, ${m_pcent:-?} used)"
     else
         echo "  [UNMOUNTED] $MERGERFS_MOUNT"
     fi
@@ -1025,7 +1037,7 @@ case "$ACTION" in
     lock|--lock)
         do_lock
         ;;
-    status|--status)
+    status|--status|-s)
         do_status
         ;;
     *)
