@@ -96,15 +96,140 @@ read_passphrase() {
     fi
 }
 
-# Discover /export/* bind mounts from config and /etc/fstab matching the pool or underlying drives
+# Resolve block device path for a branch mount point from fstab, systemd, config.xml, findmnt, or path convention
+resolve_fs_spec() {
+    local mnt="${1%/}"
+    local fs_spec=""
+
+    # 1. Check /etc/fstab
+    if [[ -f /etc/fstab ]]; then
+        fs_spec="$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $1; exit}' /etc/fstab 2>/dev/null || true)"
+    fi
+
+    # 2. Check systemd .mount unit
+    if [[ -z "$fs_spec" ]]; then
+        local unit_name unit_path
+        unit_name="$(systemd-escape -p --suffix=mount "$mnt" 2>/dev/null || true)"
+        unit_path="/etc/systemd/system/${unit_name}"
+        if [[ -n "$unit_name" && -f "$unit_path" ]]; then
+            fs_spec="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="What"{print $2; exit}' "$unit_path" 2>/dev/null || true)"
+        fi
+    fi
+
+    # 3. Check OMV config.xml mntent
+    if [[ -z "$fs_spec" ]] && command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
+        fs_spec="$(xmlstarlet sel -t -m "//system/fstab/mntent[dir='${mnt}']" -v "fsname" -n /etc/openmediavault/config.xml 2>/dev/null | awk 'NR==1{print; exit}' || true)"
+    fi
+
+    # 4. Check active mount table if currently mounted
+    if [[ -z "$fs_spec" ]] && mountpoint -q "$mnt" 2>/dev/null; then
+        fs_spec="$(findmnt -rn -o SOURCE --mountpoint "$mnt" 2>/dev/null | awk 'NR==1{print; exit}' || true)"
+    fi
+
+    # 5. Derive from OMV /srv/dev-disk-by-* mount path convention
+    if [[ -z "$fs_spec" ]]; then
+        if [[ "$mnt" =~ ^/srv/dev-disk-by-uuid-(.+)$ ]]; then
+            fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
+        elif [[ "$mnt" =~ ^/srv/dev-disk-by-label-(.+)$ ]]; then
+            fs_spec="/dev/disk/by-label/${BASH_REMATCH[1]}"
+        elif [[ "$mnt" =~ ^/srv/dev-disk-by-id-(.+)$ ]]; then
+            fs_spec="/dev/disk/by-id/${BASH_REMATCH[1]}"
+        fi
+    fi
+
+    # Strip optional quotes around UUID=... or LABEL=...
+    fs_spec="${fs_spec//\"/}"
+    fs_spec="${fs_spec//\'/}"
+    if [[ "$fs_spec" =~ ^UUID=(.+)$ ]]; then
+        fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
+    elif [[ "$fs_spec" =~ ^LABEL=(.+)$ ]]; then
+        fs_spec="/dev/disk/by-label/${BASH_REMATCH[1]}"
+    fi
+
+    printf '%s' "$fs_spec"
+}
+
+# Mount a branch filesystem via /etc/fstab, systemd .mount unit, OMV config.xml, or direct device mount
+mount_branch_fs() {
+    local mnt="${1%/}"
+    local luks_uuid="${2:-}"
+
+    # 1. If present in /etc/fstab, mount directly using fstab options
+    if [[ -f /etc/fstab ]] && awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {found=1; exit} END {exit !found}' /etc/fstab 2>/dev/null; then
+        mount "$mnt"
+        return 0
+    fi
+
+    # 2. If a systemd .mount unit exists for this mountpoint, start it
+    local unit_name
+    unit_name="$(systemd-escape -p --suffix=mount "$mnt" 2>/dev/null || true)"
+    if [[ -n "$unit_name" ]] && { [[ -f "/etc/systemd/system/${unit_name}" ]] || systemctl list-unit-files "$unit_name" &>/dev/null; }; then
+        systemctl reset-failed "$unit_name" 2>/dev/null || true
+        systemctl start "$unit_name"
+        return 0
+    fi
+
+    # 3. Otherwise, resolve the underlying device and mount directly
+    local fs_dev
+    fs_dev="$(resolve_fs_spec "$mnt")"
+    if [[ -z "$fs_dev" && -n "$luks_uuid" ]]; then
+        local active_mapper
+        active_mapper="$(get_active_mapper "$luks_uuid")"
+        [[ -n "$active_mapper" ]] && fs_dev="/dev/mapper/${active_mapper}"
+    fi
+
+    if [[ -z "$fs_dev" || ! -e "$fs_dev" ]]; then
+        echo "Error: Could not resolve block device to mount $mnt." >&2
+        return 1
+    fi
+
+    mkdir -p "$mnt"
+    local opts=""
+    if command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
+        opts="$(xmlstarlet sel -t -m "//system/fstab/mntent[dir='${mnt}']" -v "opts" -n /etc/openmediavault/config.xml 2>/dev/null | awk 'NR==1{print; exit}' || true)"
+    fi
+
+    if [[ -n "$opts" ]]; then
+        mount -o "$opts" "$fs_dev" "$mnt"
+    else
+        mount "$fs_dev" "$mnt"
+    fi
+}
+
+# Discover /export/* bind mounts from config, /etc/fstab, systemd units, or OMV config.xml
 get_export_mounts() {
     local exports=()
     for m in "${EXPORT_MOUNTS[@]:-}"; do
-        [[ -n "$m" ]] && exports+=("$m")
+        [[ -n "$m" ]] && exports+=("${m%/}")
     done
 
-    while read -r src dst; do
-        [[ -z "$dst" ]] && continue
+    local candidate_pairs=()
+    if [[ -f /etc/fstab ]]; then
+        while read -r src dst; do
+            [[ -n "$src" && -n "$dst" ]] && candidate_pairs+=("${src}:${dst}")
+        done < <(awk '$1 !~ /^#/ && $2 ~ /^\/export\// {print $1, $2}' /etc/fstab 2>/dev/null || true)
+    fi
+
+    for unit_file in /etc/systemd/system/export-*.mount; do
+        [[ -f "$unit_file" ]] || continue
+        local src dst
+        src="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="What"{print $2; exit}' "$unit_file" 2>/dev/null || true)"
+        dst="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="Where"{print $2; exit}' "$unit_file" 2>/dev/null || true)"
+        [[ -n "$src" && -n "$dst" ]] && candidate_pairs+=("${src}:${dst}")
+    done
+
+    if command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
+        while read -r src dst; do
+            [[ -n "$src" && -n "$dst" ]] && candidate_pairs+=("${src}:${dst}")
+        done < <(xmlstarlet sel -t -m "//system/fstab/mntent[starts-with(dir, '/export/')]" -v "concat(fsname, ' ', dir)" -n /etc/openmediavault/config.xml 2>/dev/null || true)
+    fi
+
+    for pair in "${candidate_pairs[@]:-}"; do
+        [[ -z "$pair" ]] && continue
+        local src="${pair%%:*}"
+        local dst="${pair#*:}"
+        src="${src%/}"
+        dst="${dst%/}"
         local match=0
         if [[ "$src" == "$MERGERFS_MOUNT" || "$src" == "${MERGERFS_MOUNT}/"* ]]; then
             match=1
@@ -121,11 +246,39 @@ get_export_mounts() {
             done
             [[ $already -eq 0 ]] && exports+=("$dst")
         fi
-    done < <(awk '$1 !~ /^#/ && $2 ~ /^\/export\// {print $1, $2}' /etc/fstab 2>/dev/null)
+    done
 
     for m in "${exports[@]:-}"; do
         [[ -n "$m" ]] && printf '%s\n' "$m"
     done
+}
+
+mount_export_bind() {
+    local exp_mnt="${1%/}"
+    if [[ -f /etc/fstab ]] && awk -v m="$exp_mnt" '$1 !~ /^#/ && $2 == m {found=1; exit} END {exit !found}' /etc/fstab 2>/dev/null; then
+        mount "$exp_mnt"
+        return 0
+    fi
+
+    local unit_name
+    unit_name="$(systemd-escape -p --suffix=mount "$exp_mnt" 2>/dev/null || true)"
+    if [[ -n "$unit_name" ]] && { [[ -f "/etc/systemd/system/${unit_name}" ]] || systemctl list-unit-files "$unit_name" &>/dev/null; }; then
+        systemctl reset-failed "$unit_name" 2>/dev/null || true
+        systemctl start "$unit_name"
+        return 0
+    fi
+
+    if command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
+        local src
+        src="$(xmlstarlet sel -t -m "//system/fstab/mntent[dir='${exp_mnt}']" -v "fsname" -n /etc/openmediavault/config.xml 2>/dev/null | awk 'NR==1{print; exit}' || true)"
+        if [[ -n "$src" ]]; then
+            mkdir -p "$exp_mnt"
+            mount --bind "$src" "$exp_mnt"
+            return 0
+        fi
+    fi
+
+    mount "$exp_mnt"
 }
 
 # Discover enabled SMB/NFS services from config, OMV config.xml, or systemd
@@ -209,7 +362,7 @@ do_config() {
     raw_branches="${raw_branches//$'\n'/:}"
     IFS=':' read -r -a raw_branch_list <<< "$raw_branches"
 
-    # Expand any wildcard branch patterns (e.g. /srv/dev-disk-by-uuid-*) against /etc/fstab
+    # Expand any wildcard branch patterns (e.g. /srv/dev-disk-by-uuid-*) across fstab, systemd, config.xml, and /srv
     local branch_list=()
     for branch in "${raw_branch_list[@]}"; do
         branch="${branch%%=*}"
@@ -223,13 +376,34 @@ do_config() {
         fi
 
         if [[ "$mnt_pattern" == *"*"* || "$mnt_pattern" == *"?"* ]]; then
-            while read -r fstab_mnt; do
-                [[ -z "$fstab_mnt" ]] && continue
+            local candidate_mnts=()
+            if [[ -f /etc/fstab ]]; then
+                while read -r m; do
+                    [[ -n "$m" ]] && candidate_mnts+=("${m%/}")
+                done < <(awk '$1 !~ /^#/ && NF >= 2 {print $2}' /etc/fstab 2>/dev/null || true)
+            fi
+            for unit_file in /etc/systemd/system/srv-*.mount; do
+                [[ -f "$unit_file" ]] || continue
+                local m
+                m="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="Where"{print $2; exit}' "$unit_file" 2>/dev/null || true)"
+                [[ -n "$m" ]] && candidate_mnts+=("${m%/}")
+            done
+            if command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
+                while read -r m; do
+                    [[ -n "$m" ]] && candidate_mnts+=("${m%/}")
+                done < <(xmlstarlet sel -t -m "//system/fstab/mntent" -v "dir" -n /etc/openmediavault/config.xml 2>/dev/null || true)
+            fi
+            for d in /srv/dev-disk-by-*; do
+                [[ -d "$d" ]] && candidate_mnts+=("${d%/}")
+            done
+
+            for cand_mnt in "${candidate_mnts[@]:-}"; do
+                [[ -z "$cand_mnt" || "$cand_mnt" == "$mergerfs_mount" ]] && continue
                 # shellcheck disable=SC2254
-                case "$fstab_mnt" in
-                    $mnt_pattern) branch_list+=("$fstab_mnt") ;;
+                case "$cand_mnt" in
+                    $mnt_pattern) branch_list+=("$cand_mnt") ;;
                 esac
-            done < <(awk '$1 !~ /^#/ && NF >= 2 {print $2}' /etc/fstab 2>/dev/null)
+            done
         else
             branch_list+=("$mnt_pattern")
         fi
@@ -248,23 +422,10 @@ do_config() {
         [[ $already_added -eq 1 ]] && continue
 
         local fs_spec
-        fs_spec="$(awk -v m="$mnt" '$1 !~ /^#/ && $2 == m {print $1; exit}' /etc/fstab)"
+        fs_spec="$(resolve_fs_spec "$mnt")"
         if [[ -z "$fs_spec" ]]; then
-            if [[ "$mnt" =~ ^/srv/dev-disk-by-uuid-(.+)$ ]]; then
-                fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
-            else
-                echo "Error: Could not find $mnt in /etc/fstab." >&2
-                exit 1
-            fi
-        fi
-
-        # Strip optional quotes around UUID=... or LABEL=... in /etc/fstab
-        fs_spec="${fs_spec//\"/}"
-        fs_spec="${fs_spec//\'/}"
-        if [[ "$fs_spec" =~ ^UUID=(.+)$ ]]; then
-            fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
-        elif [[ "$fs_spec" =~ ^LABEL=(.+)$ ]]; then
-            fs_spec="/dev/disk/by-label/${BASH_REMATCH[1]}"
+            echo "Error: Could not resolve underlying block device for $mnt (checked /etc/fstab, systemd units, OMV config.xml, active mounts, and path convention)." >&2
+            exit 1
         fi
 
         fs_mounts+=("$mnt")
@@ -519,7 +680,9 @@ do_unlock() {
     fi
 
     local newly_mounted_fs=0
-    for mnt in "${FS_MOUNTS[@]}"; do
+    for i in "${!FS_MOUNTS[@]}"; do
+        local mnt="${FS_MOUNTS[$i]}"
+        local luks_uuid="${LUKS_UUIDS[$i]:-}"
         if mountpoint -q "$mnt"; then
             echo "[OK] $mnt is already mounted."
         elif [[ $DRY_RUN -eq 1 ]]; then
@@ -527,7 +690,7 @@ do_unlock() {
             newly_mounted_fs=1
         else
             echo "Mounting $mnt..."
-            mount "$mnt"
+            mount_branch_fs "$mnt" "$luks_uuid"
             newly_mounted_fs=1
             echo "[OK] Mounted $mnt."
         fi
@@ -559,7 +722,7 @@ do_unlock() {
             echo "[DRY-RUN] Would mount export bind mount $exp_mnt."
         else
             echo "Mounting export bind mount $exp_mnt..."
-            mount "$exp_mnt"
+            mount_export_bind "$exp_mnt"
             echo "[OK] Mounted $exp_mnt."
         fi
     done < <(get_export_mounts)
