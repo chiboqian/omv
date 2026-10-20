@@ -99,6 +99,7 @@ read_passphrase() {
 # Resolve block device path for a branch mount point from fstab, systemd, config.xml, findmnt, or path convention
 resolve_fs_spec() {
     local mnt="${1%/}"
+    [[ "$mnt" == /* ]] || return 0
     local fs_spec=""
 
     # 1. Check /etc/fstab
@@ -128,11 +129,11 @@ resolve_fs_spec() {
 
     # 5. Derive from OMV /srv/dev-disk-by-* mount path convention
     if [[ -z "$fs_spec" ]]; then
-        if [[ "$mnt" =~ ^/srv/dev-disk-by-uuid-(.+)$ ]]; then
+        if [[ "$mnt" =~ ^/srv/dev-disk-by-uuid[-/](.+)$ ]]; then
             fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
-        elif [[ "$mnt" =~ ^/srv/dev-disk-by-label-(.+)$ ]]; then
+        elif [[ "$mnt" =~ ^/srv/dev-disk-by-label[-/](.+)$ ]]; then
             fs_spec="/dev/disk/by-label/${BASH_REMATCH[1]}"
-        elif [[ "$mnt" =~ ^/srv/dev-disk-by-id-(.+)$ ]]; then
+        elif [[ "$mnt" =~ ^/srv/dev-disk-by-id[-/](.+)$ ]]; then
             fs_spec="/dev/disk/by-id/${BASH_REMATCH[1]}"
         fi
     fi
@@ -342,12 +343,46 @@ do_config() {
 
     if [[ -f "$unit_path" ]]; then
         echo "[INFO] Reading systemd unit: $unit_path"
-        raw_branches="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="What"{print $2; exit}' "$unit_path")"
         local where_path
         where_path="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="Where"{print $2; exit}' "$unit_path")"
         [[ -n "$where_path" ]] && mergerfs_mount="${where_path%/}"
-    elif command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
-        echo "[INFO] Unit $unit_path not found; querying /etc/openmediavault/config.xml..."
+
+        # 1. Modern openmediavault-mergerfs puts branches in Options=branches=... (while What= is poolname:uuid)
+        raw_branches="$(awk '
+            /^[[:space:]]*Options[[:space:]]*=/ {
+                sub(/^[[:space:]]*Options[[:space:]]*=[[:space:]]*/, "")
+                n = split($0, opts, ",")
+                for (i = 1; i <= n; i++) {
+                    if (opts[i] ~ /^branches=/) {
+                        sub(/^branches=/, "", opts[i])
+                        print opts[i]
+                        exit
+                    }
+                }
+            }
+        ' "$unit_path")"
+
+        # 2. Legacy openmediavault-mergerfs puts colon-separated paths in What=/srv/...:/srv/...
+        if [[ -z "$raw_branches" ]]; then
+            local what_val
+            what_val="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="What"{print $2; exit}' "$unit_path")"
+            [[ "$what_val" == /* ]] && raw_branches="$what_val"
+        fi
+
+        # 3. Fallback to RequiresMountsFor= in [Unit]
+        if [[ -z "$raw_branches" ]]; then
+            raw_branches="$(awk '
+                /^[[:space:]]*RequiresMountsFor[[:space:]]*=/ {
+                    sub(/^[[:space:]]*RequiresMountsFor[[:space:]]*=[[:space:]]*/, "")
+                    gsub(/[[:space:]]+/, ":")
+                    print $0
+                }
+            ' "$unit_path" | paste -sd: - || true)"
+        fi
+    fi
+
+    if [[ -z "$raw_branches" ]] && command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
+        echo "[INFO] Querying /etc/openmediavault/config.xml for MergerFS pool '${pool_name}'..."
         raw_branches="$(xmlstarlet sel -t -m "//services/mergerfs/pools/pool[name='${pool_name}']" -v "paths" -n /etc/openmediavault/config.xml || true)"
     fi
 
@@ -369,7 +404,7 @@ do_config() {
         [[ -z "$branch" ]] && continue
 
         local mnt_pattern
-        if [[ "$branch" =~ ^(/srv/dev-disk-by-uuid-[^/]+) ]]; then
+        if [[ "$branch" =~ ^(/srv/dev-disk-by-uuid[-/][^/]+) ]]; then
             mnt_pattern="${BASH_REMATCH[1]}"
         else
             mnt_pattern="${branch%/}"
