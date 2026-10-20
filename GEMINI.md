@@ -24,7 +24,7 @@ This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script fo
    - Automatically discovers `/export/*` NFS bind mounts backed by the MergerFS pool (or its underlying branch mounts) from `/etc/fstab`, systemd `export-*.mount` units, or `/etc/openmediavault/config.xml`, mounting them after MergerFS on `unlock` and unmounting them before MergerFS on `lock`.
    - Detects enabled OMV file-sharing services (`smbd.service`, `nfs-server.service`) via `systemctl` and `/etc/openmediavault/config.xml`:
      - On `unlock`: starts or reloads `smbd.service` / `nfs-server.service` after the pool and exports are mounted.
-     - On `lock`: stops `smbd.service` / `nfs-server.service` before unmounting so open SMB/NFS file handles do not block `umount` with `target is busy`.
+     - On `lock`: stops `smbd.service` / `nfs-server.service` before unmounting so open SMB/NFS file handles do not block `umount` with `target is busy`, then starts `smbd.service` / `nfs-server.service` back up after locking so other shares remain active.
 
 5. **Configuration (`/etc/omv-pool.conf`)**
    - Generated automatically by inspecting `/etc/systemd/system/srv-mergerfs-*.mount` (or `/etc/openmediavault/config.xml`), `/etc/fstab`, and `lsblk`/`cryptsetup luksUUID`.

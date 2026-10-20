@@ -9,7 +9,7 @@ usage() {
 Usage:
   sudo $(basename "$0") [-n|--dry-run] config <mergerfs-pool-name>   Generate and save $CONFIG_FILE
   sudo $(basename "$0") [-n|--dry-run] unlock                        Unlock LUKS, mount filesystems + MergerFS + exports, and start SMB/NFS
-  sudo $(basename "$0") [-n|--dry-run] lock                          Stop SMB/NFS, unmount exports + MergerFS + filesystems, and lock LUKS
+  sudo $(basename "$0") [-n|--dry-run] lock                          Stop SMB/NFS, unmount exports + MergerFS + filesystems, lock LUKS, and restart SMB/NFS
   sudo $(basename "$0") status                                       Show current LUKS, mount, and SMB/NFS share status
 
 Options:
@@ -922,10 +922,22 @@ do_lock() {
         fi
     done
 
+    # Start SMB/NFS share services back up after locking so other shares remain active
+    for svc in "${services[@]:-}"; do
+        [[ -z "$svc" ]] && continue
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] Would start $svc."
+        else
+            echo "Starting $svc..."
+            systemctl start "$svc"
+            echo "[OK] Started $svc."
+        fi
+    done
+
     if [[ $DRY_RUN -eq 1 ]]; then
         echo "[DRY-RUN] Done! No changes were made."
     else
-        echo "Done! Shared folders stopped, filesystems unmounted, and LUKS drives locked."
+        echo "Done! Filesystems unmounted, LUKS drives locked, and SMB/NFS services restarted."
     fi
 }
 
