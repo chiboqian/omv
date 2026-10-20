@@ -541,18 +541,30 @@ do_config() {
             exit 1
         fi
 
-        local resolved_fs_dev cur_dev parent_dev="" pkname
+        local resolved_fs_dev parent_dev="" kname
         resolved_fs_dev="$(readlink -f "$fs_dev")"
-        cur_dev="$resolved_fs_dev"
-        for _ in 1 2 3 4; do
-            pkname="$(lsblk -ndo PKNAME "$cur_dev" 2>/dev/null | awk 'NR==1{print; exit}' || true)"
-            [[ -z "$pkname" ]] && break
-            cur_dev="/dev/${pkname}"
-            if cryptsetup isLuks "$cur_dev" 2>/dev/null; then
-                parent_dev="$cur_dev"
+
+        # Walk inverse block device dependencies (e.g. dm-3 -> sde) via lsblk -s
+        while read -r kname; do
+            [[ -z "$kname" ]] && continue
+            if cryptsetup isLuks "/dev/${kname}" 2>/dev/null; then
+                parent_dev="/dev/${kname}"
                 break
             fi
-        done
+        done < <(lsblk -snlo KNAME "$resolved_fs_dev" 2>/dev/null || true)
+
+        # Fallback: inspect sysfs slaves directory (/sys/class/block/<dm>/slaves/*)
+        if [[ -z "$parent_dev" ]]; then
+            local dm_name="${resolved_fs_dev#/dev/}"
+            for slave_path in "/sys/class/block/${dm_name}/slaves/"*; do
+                [[ -e "$slave_path" ]] || continue
+                kname="$(basename "$slave_path")"
+                if cryptsetup isLuks "/dev/${kname}" 2>/dev/null; then
+                    parent_dev="/dev/${kname}"
+                    break
+                fi
+            done
+        fi
 
         if [[ -z "$parent_dev" ]]; then
             echo "Error: Could not find a parent LUKS partition for $fs_dev ($resolved_fs_dev)." >&2
