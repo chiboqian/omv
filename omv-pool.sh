@@ -2,17 +2,46 @@
 set -euo pipefail
 
 CONFIG_FILE="/etc/omv-pool.conf"
+DRY_RUN=0
 
 usage() {
     cat >&2 <<EOF
 Usage:
-  sudo $(basename "$0") config <mergerfs-pool-name>   Generate and save $CONFIG_FILE
-  sudo $(basename "$0") unlock                        Unlock LUKS, mount ext4 + MergerFS + exports, and start SMB/NFS
-  sudo $(basename "$0") lock                          Stop SMB/NFS, unmount exports + MergerFS + ext4, and lock LUKS
-  sudo $(basename "$0") status                        Show current LUKS, mount, and SMB/NFS share status
+  sudo $(basename "$0") [-n|--dry-run] config <mergerfs-pool-name>   Generate and save $CONFIG_FILE
+  sudo $(basename "$0") [-n|--dry-run] unlock                        Unlock LUKS, mount filesystems + MergerFS + exports, and start SMB/NFS
+  sudo $(basename "$0") [-n|--dry-run] lock                          Stop SMB/NFS, unmount exports + MergerFS + filesystems, and lock LUKS
+  sudo $(basename "$0") status                                       Show current LUKS, mount, and SMB/NFS share status
+
+Options:
+  -n, --dry-run   Show what actions would be taken without making any changes
+  -h, --help      Show this help message
 EOF
     exit 1
 }
+
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+if [[ ${#POSITIONAL_ARGS[@]} -gt 0 ]]; then
+    set -- "${POSITIONAL_ARGS[@]}"
+else
+    set --
+fi
+
+[[ $# -eq 0 ]] && usage
 
 if [[ $EUID -ne 0 ]]; then
     echo "Error: Please run as root (sudo $0 ...)." >&2
@@ -32,6 +61,11 @@ load_config() {
     fi
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
+
+    # Backwards compatibility with configs that used EXT4_MOUNTS
+    if [[ ${#FS_MOUNTS[@]:-0} -eq 0 && ${#EXT4_MOUNTS[@]:-0} -gt 0 ]]; then
+        FS_MOUNTS=("${EXT4_MOUNTS[@]}")
+    fi
 }
 
 # Discover /export/* bind mounts from config and /etc/fstab matching the pool or underlying drives
@@ -47,8 +81,8 @@ get_export_mounts() {
         if [[ "$src" == "$MERGERFS_MOUNT" || "$src" == "${MERGERFS_MOUNT}/"* ]]; then
             match=1
         fi
-        for ext4_mnt in "${EXT4_MOUNTS[@]:-}"; do
-            if [[ "$src" == "$ext4_mnt" || "$src" == "${ext4_mnt}/"* ]]; then
+        for fs_mnt in "${FS_MOUNTS[@]:-}"; do
+            if [[ "$src" == "$fs_mnt" || "$src" == "${fs_mnt}/"* ]]; then
                 match=1
             fi
         done
@@ -102,7 +136,7 @@ get_share_services() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. CONFIG: Discover LUKS UUIDs, ext4 mounts, exports & share services
+# 1. CONFIG: Discover LUKS UUIDs, filesystem mounts, exports & share services
 # ---------------------------------------------------------------------------
 do_config() {
     local input_name="${1:-}"
@@ -139,8 +173,8 @@ do_config() {
 
     IFS=':' read -r -a branch_list <<< "$raw_branches"
 
-    local ext4_mounts=()
-    local ext4_devs=()
+    local fs_mounts=()
+    local fs_devs=()
 
     for branch in "${branch_list[@]}"; do
         [[ -z "$branch" ]] && continue
@@ -153,7 +187,7 @@ do_config() {
         fi
 
         local already_added=0
-        for existing in "${ext4_mounts[@]:-}"; do
+        for existing in "${fs_mounts[@]:-}"; do
             [[ "$existing" == "$mnt" ]] && already_added=1 && break
         done
         [[ $already_added -eq 1 ]] && continue
@@ -173,71 +207,91 @@ do_config() {
             fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
         fi
 
-        ext4_mounts+=("$mnt")
-        ext4_devs+=("$fs_spec")
+        fs_mounts+=("$mnt")
+        fs_devs+=("$fs_spec")
     done
 
-    # Temporarily unlock LUKS drives if inner ext4 UUIDs aren't visible yet
+    # Temporarily unlock LUKS drives if inner filesystem UUIDs aren't visible yet
     local missing_dev=0
-    for dev in "${ext4_devs[@]}"; do
+    for dev in "${fs_devs[@]}"; do
         [[ ! -e "$dev" ]] && missing_dev=1 && break
     done
 
     if [[ $missing_dev -eq 1 ]]; then
-        echo "[INFO] LUKS drives are currently locked; unlocking to inspect inner ext4 UUIDs..."
-        local luks_pass
-        read -rsp "Enter LUKS passphrase: " luks_pass
-        echo
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] LUKS drives are currently locked; would prompt for LUKS passphrase and temporarily unlock crypto_LUKS devices:"
+            while read -r luks_dev; do
+                [[ -z "$luks_dev" ]] && continue
+                local active_crypt
+                active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}')"
+                if [[ -z "$active_crypt" ]]; then
+                    local kname mapper
+                    kname="$(lsblk -ndo KNAME "$luks_dev")"
+                    mapper="${kname}-crypt"
+                    echo "[DRY-RUN] Would unlock $luks_dev as /dev/mapper/${mapper}"
+                fi
+            done < <(blkid -t TYPE=crypto_LUKS -o device)
+        else
+            echo "[INFO] LUKS drives are currently locked; unlocking to inspect inner filesystem UUIDs..."
+            local luks_pass
+            read -rsp "Enter LUKS passphrase: " luks_pass
+            echo
 
-        while read -r luks_dev; do
-            [[ -z "$luks_dev" ]] && continue
-            local active_crypt
-            active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}')"
-            if [[ -z "$active_crypt" ]]; then
-                local kname mapper
-                kname="$(lsblk -ndo KNAME "$luks_dev")"
-                mapper="${kname}-crypt"
-                echo "Unlocking $luks_dev as /dev/mapper/${mapper}..."
-                printf '%s' "$luks_pass" | cryptsetup open "$luks_dev" "$mapper" - || true
-            fi
-        done < <(blkid -t TYPE=crypto_LUKS -o device)
+            while read -r luks_dev; do
+                [[ -z "$luks_dev" ]] && continue
+                local active_crypt
+                active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}')"
+                if [[ -z "$active_crypt" ]]; then
+                    local kname mapper
+                    kname="$(lsblk -ndo KNAME "$luks_dev")"
+                    mapper="${kname}-crypt"
+                    echo "Unlocking $luks_dev as /dev/mapper/${mapper}..."
+                    printf '%s' "$luks_pass" | cryptsetup open "$luks_dev" "$mapper" - || true
+                fi
+            done < <(blkid -t TYPE=crypto_LUKS -o device)
 
-        unset luks_pass
-        udevadm settle
+            unset luks_pass
+            udevadm settle
+        fi
     fi
 
     local luks_uuids=()
-    for i in "${!ext4_devs[@]}"; do
-        local ext4_dev="${ext4_devs[$i]}"
-        local ext4_mnt="${ext4_mounts[$i]}"
+    for i in "${!fs_devs[@]}"; do
+        local fs_dev="${fs_devs[$i]}"
+        local fs_mnt="${fs_mounts[$i]}"
 
-        if [[ ! -e "$ext4_dev" ]]; then
-            echo "Error: Inner filesystem $ext4_dev ($ext4_mnt) not found even after unlocking." >&2
+        if [[ ! -e "$fs_dev" ]]; then
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Inner filesystem $fs_dev ($fs_mnt) is currently locked; skipping parent LUKS UUID resolution."
+                luks_uuids+=("<locked-luks-uuid-for-${fs_mnt##*/}>")
+                continue
+            fi
+            echo "Error: Inner filesystem $fs_dev ($fs_mnt) not found even after unlocking." >&2
             exit 1
         fi
 
         local pkname
-        pkname="$(lsblk -ndo PKNAME "$ext4_dev")"
+        pkname="$(lsblk -ndo PKNAME "$fs_dev")"
         if [[ -z "$pkname" ]]; then
-            echo "Error: Could not find parent device for $ext4_dev." >&2
+            echo "Error: Could not find parent device for $fs_dev." >&2
             exit 1
         fi
 
         local parent_dev="/dev/${pkname}"
         if ! cryptsetup isLuks "$parent_dev"; then
-            echo "Error: Parent device $parent_dev ($ext4_mnt) is not a LUKS partition." >&2
+            echo "Error: Parent device $parent_dev ($fs_mnt) is not a LUKS partition." >&2
             exit 1
         fi
 
         local luks_uuid
         luks_uuid="$(cryptsetup luksUUID "$parent_dev")"
-        echo "[INFO] Mapped $ext4_mnt -> $parent_dev (LUKS UUID: $luks_uuid)"
+        echo "[INFO] Mapped $fs_mnt -> $parent_dev (LUKS UUID: $luks_uuid)"
         luks_uuids+=("$luks_uuid")
     done
 
     # Discover /export/* bind mounts and enabled SMB/NFS services
     MERGERFS_MOUNT="$mergerfs_mount"
-    EXT4_MOUNTS=("${ext4_mounts[@]}")
+    FS_MOUNTS=("${fs_mounts[@]}")
     EXPORT_MOUNTS=()
     SHARE_SERVICES=()
 
@@ -251,14 +305,15 @@ do_config() {
         [[ -n "$svc" ]] && service_list+=("$svc")
     done < <(get_share_services)
 
-    cat > "$CONFIG_FILE" <<EOF
+    local config_content
+    config_content="$(cat <<EOF
 # Auto-generated by $(basename "$0") for MergerFS pool: ${pool_name}
 LUKS_UUIDS=(
 $(for u in "${luks_uuids[@]}"; do printf '    "%s"\n' "$u"; done)
 )
 
-EXT4_MOUNTS=(
-$(for m in "${ext4_mounts[@]}"; do printf '    "%s"\n' "$m"; done)
+FS_MOUNTS=(
+$(for m in "${fs_mounts[@]}"; do printf '    "%s"\n' "$m"; done)
 )
 
 MERGERFS_MOUNT="${mergerfs_mount}"
@@ -271,16 +326,25 @@ SHARE_SERVICES=(
 $(for s in "${service_list[@]:-}"; do [[ -n "$s" ]] && printf '    "%s"\n' "$s"; done)
 )
 EOF
+)"
 
-    chmod 600 "$CONFIG_FILE"
-    echo "[OK] Saved configuration to $CONFIG_FILE:"
-    echo "----------------------------------------"
-    cat "$CONFIG_FILE"
-    echo "----------------------------------------"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] Would write configuration to $CONFIG_FILE (mode 0600):"
+        echo "----------------------------------------"
+        printf '%s\n' "$config_content"
+        echo "----------------------------------------"
+    else
+        printf '%s\n' "$config_content" > "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        echo "[OK] Saved configuration to $CONFIG_FILE:"
+        echo "----------------------------------------"
+        cat "$CONFIG_FILE"
+        echo "----------------------------------------"
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# 2. UNLOCK: Unlock LUKS, mount ext4 + MergerFS + exports, and start SMB/NFS
+# 2. UNLOCK: Unlock LUKS, mount filesystems + MergerFS + exports, and start SMB/NFS
 # ---------------------------------------------------------------------------
 do_unlock() {
     load_config
@@ -301,70 +365,94 @@ do_unlock() {
     done
 
     if [[ $needs_unlock -eq 1 ]]; then
-        local unlocked_all=0
-        for attempt in 1 2 3; do
-            local luks_pass
-            read -rsp "Enter LUKS passphrase: " luks_pass
-            echo
-
-            local failed=0
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] Would prompt for LUKS passphrase."
             for uuid in "${LUKS_UUIDS[@]}"; do
                 local active_mapper
                 active_mapper="$(get_active_mapper "$uuid")"
                 if [[ -n "$active_mapper" ]]; then
                     echo "[OK] $uuid is already unlocked (/dev/mapper/${active_mapper})."
-                    continue
-                fi
-
-                local dev="/dev/disk/by-uuid/${uuid}"
-                local kname mapper
-                kname="$(lsblk -ndo KNAME "$dev")"
-                mapper="${kname}-crypt"
-
-                echo "Unlocking $dev as /dev/mapper/${mapper}..."
-                if printf '%s' "$luks_pass" | cryptsetup open "$dev" "$mapper" -; then
-                    echo "[OK] Unlocked /dev/mapper/${mapper}."
                 else
-                    echo "Error: Failed to unlock $uuid (wrong passphrase?)." >&2
-                    failed=1
-                    break
+                    local dev="/dev/disk/by-uuid/${uuid}"
+                    local kname mapper
+                    kname="$(lsblk -ndo KNAME "$dev")"
+                    mapper="${kname}-crypt"
+                    echo "[DRY-RUN] Would unlock $dev as /dev/mapper/${mapper}."
                 fi
             done
+        else
+            local unlocked_all=0
+            for attempt in 1 2 3; do
+                local luks_pass
+                read -rsp "Enter LUKS passphrase: " luks_pass
+                echo
 
-            unset luks_pass
-            if [[ $failed -eq 0 ]]; then
-                unlocked_all=1
-                break
+                local failed=0
+                for uuid in "${LUKS_UUIDS[@]}"; do
+                    local active_mapper
+                    active_mapper="$(get_active_mapper "$uuid")"
+                    if [[ -n "$active_mapper" ]]; then
+                        echo "[OK] $uuid is already unlocked (/dev/mapper/${active_mapper})."
+                        continue
+                    fi
+
+                    local dev="/dev/disk/by-uuid/${uuid}"
+                    local kname mapper
+                    kname="$(lsblk -ndo KNAME "$dev")"
+                    mapper="${kname}-crypt"
+
+                    echo "Unlocking $dev as /dev/mapper/${mapper}..."
+                    if printf '%s' "$luks_pass" | cryptsetup open "$dev" "$mapper" -; then
+                        echo "[OK] Unlocked /dev/mapper/${mapper}."
+                    else
+                        echo "Error: Failed to unlock $uuid (wrong passphrase?)." >&2
+                        failed=1
+                        break
+                    fi
+                done
+
+                unset luks_pass
+                if [[ $failed -eq 0 ]]; then
+                    unlocked_all=1
+                    break
+                fi
+                echo "Try again ($attempt/3)..."
+            done
+
+            if [[ $unlocked_all -ne 1 ]]; then
+                echo "Error: Could not unlock drives after 3 attempts." >&2
+                exit 1
             fi
-            echo "Try again ($attempt/3)..."
-        done
-
-        if [[ $unlocked_all -ne 1 ]]; then
-            echo "Error: Could not unlock drives after 3 attempts." >&2
-            exit 1
         fi
     else
         echo "[OK] All LUKS drives are already unlocked."
     fi
 
-    udevadm settle
+    if [[ $DRY_RUN -eq 0 ]]; then
+        udevadm settle
+    fi
 
-    local newly_mounted_ext4=0
-    for mnt in "${EXT4_MOUNTS[@]}"; do
+    local newly_mounted_fs=0
+    for mnt in "${FS_MOUNTS[@]}"; do
         if mountpoint -q "$mnt"; then
             echo "[OK] $mnt is already mounted."
+        elif [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] Would mount $mnt."
+            newly_mounted_fs=1
         else
             echo "Mounting $mnt..."
             mount "$mnt"
-            newly_mounted_ext4=1
+            newly_mounted_fs=1
             echo "[OK] Mounted $mnt."
         fi
     done
 
     local mergerfs_unit
     mergerfs_unit="$(systemd-escape -p --suffix=mount "$MERGERFS_MOUNT")"
-    if mountpoint -q "$MERGERFS_MOUNT" && [[ $newly_mounted_ext4 -eq 0 ]]; then
+    if mountpoint -q "$MERGERFS_MOUNT" && [[ $newly_mounted_fs -eq 0 ]]; then
         echo "[OK] MergerFS pool ($MERGERFS_MOUNT) is already mounted."
+    elif [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] Would mount MergerFS pool ($MERGERFS_MOUNT) via $mergerfs_unit."
     else
         echo "Mounting MergerFS pool ($MERGERFS_MOUNT)..."
         systemctl restart "$mergerfs_unit" 2>/dev/null || mount "$MERGERFS_MOUNT"
@@ -376,6 +464,8 @@ do_unlock() {
         [[ -z "$exp_mnt" ]] && continue
         if mountpoint -q "$exp_mnt"; then
             echo "[OK] Export bind mount $exp_mnt is already mounted."
+        elif [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] Would mount export bind mount $exp_mnt."
         else
             echo "Mounting export bind mount $exp_mnt..."
             mount "$exp_mnt"
@@ -387,21 +477,33 @@ do_unlock() {
     while read -r svc; do
         [[ -z "$svc" ]] && continue
         if systemctl is-active --quiet "$svc"; then
-            echo "Reloading $svc..."
-            systemctl reload-or-restart "$svc"
-            echo "[OK] Reloaded $svc."
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Would reload $svc."
+            else
+                echo "Reloading $svc..."
+                systemctl reload-or-restart "$svc"
+                echo "[OK] Reloaded $svc."
+            fi
         else
-            echo "Starting $svc..."
-            systemctl start "$svc"
-            echo "[OK] Started $svc."
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Would start $svc."
+            else
+                echo "Starting $svc..."
+                systemctl start "$svc"
+                echo "[OK] Started $svc."
+            fi
         fi
     done < <(get_share_services)
 
-    echo "Done! Pool is unlocked, mounted, and shared folders are active."
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] Done! No changes were made."
+    else
+        echo "Done! Pool is unlocked, mounted, and shared folders are active."
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# 3. LOCK: Stop SMB/NFS, unmount exports + MergerFS + ext4, then close LUKS
+# 3. LOCK: Stop SMB/NFS, unmount exports + MergerFS + filesystems, then close LUKS
 # ---------------------------------------------------------------------------
 do_lock() {
     load_config
@@ -415,9 +517,13 @@ do_lock() {
     for (( idx=${#services[@]}-1 ; idx>=0 ; idx-- )); do
         local svc="${services[$idx]}"
         if systemctl is-active --quiet "$svc"; then
-            echo "Stopping $svc..."
-            systemctl stop "$svc"
-            echo "[OK] Stopped $svc."
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Would stop $svc."
+            else
+                echo "Stopping $svc..."
+                systemctl stop "$svc"
+                echo "[OK] Stopped $svc."
+            fi
         else
             echo "[OK] $svc is already stopped."
         fi
@@ -427,13 +533,17 @@ do_lock() {
     while read -r exp_mnt; do
         [[ -z "$exp_mnt" ]] && continue
         if mountpoint -q "$exp_mnt"; then
-            echo "Unmounting export bind mount $exp_mnt..."
-            if ! umount "$exp_mnt"; then
-                echo "Error: $exp_mnt is busy! Active processes:" >&2
-                fuser -vm "$exp_mnt" || true
-                exit 1
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Would unmount export bind mount $exp_mnt."
+            else
+                echo "Unmounting export bind mount $exp_mnt..."
+                if ! umount "$exp_mnt"; then
+                    echo "Error: $exp_mnt is busy! Active processes:" >&2
+                    fuser -vm "$exp_mnt" || true
+                    exit 1
+                fi
+                echo "[OK] Unmounted $exp_mnt."
             fi
-            echo "[OK] Unmounted $exp_mnt."
         else
             echo "[OK] Export bind mount $exp_mnt is already unmounted."
         fi
@@ -442,32 +552,44 @@ do_lock() {
     local mergerfs_unit
     mergerfs_unit="$(systemd-escape -p --suffix=mount "$MERGERFS_MOUNT")"
     if mountpoint -q "$MERGERFS_MOUNT"; then
-        echo "Unmounting MergerFS pool ($MERGERFS_MOUNT)..."
-        if ! systemctl stop "$mergerfs_unit" 2>/dev/null && ! umount "$MERGERFS_MOUNT"; then
-            echo "Error: $MERGERFS_MOUNT is busy! Active processes:" >&2
-            fuser -vm "$MERGERFS_MOUNT" || true
-            exit 1
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] Would unmount MergerFS pool ($MERGERFS_MOUNT) via $mergerfs_unit."
+        else
+            echo "Unmounting MergerFS pool ($MERGERFS_MOUNT)..."
+            if ! systemctl stop "$mergerfs_unit" 2>/dev/null && ! umount "$MERGERFS_MOUNT"; then
+                echo "Error: $MERGERFS_MOUNT is busy! Active processes:" >&2
+                fuser -vm "$MERGERFS_MOUNT" || true
+                exit 1
+            fi
+            echo "[OK] Unmounted $MERGERFS_MOUNT."
         fi
-        echo "[OK] Unmounted $MERGERFS_MOUNT."
     else
         echo "[OK] $MERGERFS_MOUNT is already unmounted."
     fi
 
-    for mnt in "${EXT4_MOUNTS[@]}"; do
+    for mnt in "${FS_MOUNTS[@]}"; do
         if mountpoint -q "$mnt"; then
-            echo "Unmounting $mnt..."
-            if ! umount "$mnt"; then
-                echo "Error: $mnt is busy! Active processes:" >&2
-                fuser -vm "$mnt" || true
-                exit 1
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Would unmount $mnt."
+            else
+                echo "Unmounting $mnt..."
+                if ! umount "$mnt"; then
+                    echo "Error: $mnt is busy! Active processes:" >&2
+                    fuser -vm "$mnt" || true
+                    exit 1
+                fi
+                echo "[OK] Unmounted $mnt."
             fi
-            echo "[OK] Unmounted $mnt."
         else
             echo "[OK] $mnt is already unmounted."
         fi
     done
 
-    sync
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] Would flush filesystem buffers (sync)."
+    else
+        sync
+    fi
 
     for uuid in "${LUKS_UUIDS[@]}"; do
         local dev="/dev/disk/by-uuid/${uuid}"
@@ -476,19 +598,27 @@ do_lock() {
         local mapper
         mapper="$(get_active_mapper "$uuid")"
         if [[ -n "$mapper" ]]; then
-            echo "Locking /dev/mapper/${mapper}..."
-            cryptsetup close "$mapper"
-            echo "[OK] Locked ${mapper}."
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] Would lock /dev/mapper/${mapper}."
+            else
+                echo "Locking /dev/mapper/${mapper}..."
+                cryptsetup close "$mapper"
+                echo "[OK] Locked ${mapper}."
+            fi
         else
             echo "[OK] $uuid is already locked."
         fi
     done
 
-    echo "Done! Shared folders stopped, filesystems unmounted, and LUKS drives locked."
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] Done! No changes were made."
+    else
+        echo "Done! Shared folders stopped, filesystems unmounted, and LUKS drives locked."
+    fi
 }
 
 # ---------------------------------------------------------------------------
-# 4. STATUS: Show current state of LUKS, ext4, MergerFS, exports, and SMB/NFS
+# 4. STATUS: Show current state of LUKS, filesystems, MergerFS, exports, and SMB/NFS
 # ---------------------------------------------------------------------------
 do_status() {
     load_config
@@ -503,8 +633,8 @@ do_status() {
         fi
     done
 
-    echo "=== Ext4 Mounts ==="
-    for mnt in "${EXT4_MOUNTS[@]}"; do
+    echo "=== Filesystem Mounts ==="
+    for mnt in "${FS_MOUNTS[@]}"; do
         if mountpoint -q "$mnt"; then
             echo "  [MOUNTED]   $mnt"
         else
