@@ -50,7 +50,8 @@ fi
 
 get_active_mapper() {
     local dev="/dev/disk/by-uuid/$1"
-    lsblk -nlo NAME,TYPE "$dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}'
+    [[ -e "$dev" ]] || return 0
+    lsblk -nlo NAME,TYPE "$dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}' || true
 }
 
 load_config() {
@@ -59,12 +60,39 @@ load_config() {
         echo "Run 'sudo $(basename "$0") config <mergerfs-pool-name>' first." >&2
         exit 1
     fi
+    LUKS_UUIDS=()
+    FS_MOUNTS=()
+    EXT4_MOUNTS=()
+    MERGERFS_MOUNT=""
+    EXPORT_MOUNTS=()
+    SHARE_SERVICES=()
+
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
 
     # Backwards compatibility with configs that used EXT4_MOUNTS
-    if [[ ${#FS_MOUNTS[@]:-0} -eq 0 && ${#EXT4_MOUNTS[@]:-0} -gt 0 ]]; then
+    if [[ ${#FS_MOUNTS[@]} -eq 0 && ${#EXT4_MOUNTS[@]} -gt 0 ]]; then
         FS_MOUNTS=("${EXT4_MOUNTS[@]}")
+    fi
+
+    MERGERFS_MOUNT="${MERGERFS_MOUNT%/}"
+    for i in "${!FS_MOUNTS[@]}"; do
+        FS_MOUNTS[$i]="${FS_MOUNTS[$i]%/}"
+    done
+
+    if [[ ${#LUKS_UUIDS[@]} -eq 0 || ${#FS_MOUNTS[@]} -eq 0 || -z "$MERGERFS_MOUNT" ]]; then
+        echo "Error: $CONFIG_FILE is incomplete (missing LUKS_UUIDS, FS_MOUNTS, or MERGERFS_MOUNT)." >&2
+        exit 1
+    fi
+}
+
+read_passphrase() {
+    luks_pass=""
+    if [[ -t 0 ]]; then
+        IFS= read -rsp "Enter LUKS passphrase: " luks_pass || [[ -n "$luks_pass" ]]
+        echo
+    else
+        IFS= read -r luks_pass || [[ -n "$luks_pass" ]]
     fi
 }
 
@@ -142,7 +170,13 @@ do_config() {
     local input_name="${1:-}"
     [[ -z "$input_name" ]] && usage
 
-    local pool_name="${input_name#/srv/mergerfs/}"
+    local pool_name="$input_name"
+    pool_name="${pool_name#/etc/systemd/system/}"
+    if [[ "$pool_name" == srv-mergerfs-* ]]; then
+        pool_name="${pool_name%.mount}"
+        pool_name="$(systemd-escape -u -p "$pool_name" 2>/dev/null || printf '%s' "$pool_name")"
+    fi
+    pool_name="${pool_name#/srv/mergerfs/}"
     pool_name="${pool_name%/}"
     pool_name="${pool_name#srv-mergerfs-}"
     pool_name="${pool_name%.mount}"
@@ -158,7 +192,7 @@ do_config() {
         raw_branches="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="What"{print $2; exit}' "$unit_path")"
         local where_path
         where_path="$(awk -F'[[:space:]]*=[[:space:]]*' '$1=="Where"{print $2; exit}' "$unit_path")"
-        [[ -n "$where_path" ]] && mergerfs_mount="$where_path"
+        [[ -n "$where_path" ]] && mergerfs_mount="${where_path%/}"
     elif command -v xmlstarlet &>/dev/null && [[ -f /etc/openmediavault/config.xml ]]; then
         echo "[INFO] Unit $unit_path not found; querying /etc/openmediavault/config.xml..."
         raw_branches="$(xmlstarlet sel -t -m "//services/mergerfs/pools/pool[name='${pool_name}']" -v "paths" -n /etc/openmediavault/config.xml || true)"
@@ -171,20 +205,41 @@ do_config() {
         exit 1
     fi
 
-    IFS=':' read -r -a branch_list <<< "$raw_branches"
+    # Normalize newline-separated paths from config.xml into colon-separated branches
+    raw_branches="${raw_branches//$'\n'/:}"
+    IFS=':' read -r -a raw_branch_list <<< "$raw_branches"
+
+    # Expand any wildcard branch patterns (e.g. /srv/dev-disk-by-uuid-*) against /etc/fstab
+    local branch_list=()
+    for branch in "${raw_branch_list[@]}"; do
+        branch="${branch%%=*}"
+        [[ -z "$branch" ]] && continue
+
+        local mnt_pattern
+        if [[ "$branch" =~ ^(/srv/dev-disk-by-uuid-[^/]+) ]]; then
+            mnt_pattern="${BASH_REMATCH[1]}"
+        else
+            mnt_pattern="${branch%/}"
+        fi
+
+        if [[ "$mnt_pattern" == *"*"* || "$mnt_pattern" == *"?"* ]]; then
+            while read -r fstab_mnt; do
+                [[ -z "$fstab_mnt" ]] && continue
+                # shellcheck disable=SC2254
+                case "$fstab_mnt" in
+                    $mnt_pattern) branch_list+=("$fstab_mnt") ;;
+                esac
+            done < <(awk '$1 !~ /^#/ && NF >= 2 {print $2}' /etc/fstab 2>/dev/null)
+        else
+            branch_list+=("$mnt_pattern")
+        fi
+    done
 
     local fs_mounts=()
     local fs_devs=()
 
-    for branch in "${branch_list[@]}"; do
-        [[ -z "$branch" ]] && continue
-
-        local mnt
-        if [[ "$branch" =~ ^(/srv/dev-disk-by-uuid-[^/]+) ]]; then
-            mnt="${BASH_REMATCH[1]}"
-        else
-            mnt="${branch%/}"
-        fi
+    for mnt in "${branch_list[@]}"; do
+        [[ -z "$mnt" ]] && continue
 
         local already_added=0
         for existing in "${fs_mounts[@]:-}"; do
@@ -203,13 +258,23 @@ do_config() {
             fi
         fi
 
+        # Strip optional quotes around UUID=... or LABEL=... in /etc/fstab
+        fs_spec="${fs_spec//\"/}"
+        fs_spec="${fs_spec//\'/}"
         if [[ "$fs_spec" =~ ^UUID=(.+)$ ]]; then
             fs_spec="/dev/disk/by-uuid/${BASH_REMATCH[1]}"
+        elif [[ "$fs_spec" =~ ^LABEL=(.+)$ ]]; then
+            fs_spec="/dev/disk/by-label/${BASH_REMATCH[1]}"
         fi
 
         fs_mounts+=("$mnt")
         fs_devs+=("$fs_spec")
     done
+
+    if [[ ${#fs_mounts[@]} -eq 0 ]]; then
+        echo "Error: No valid branch mounts found for MergerFS pool '${pool_name}'." >&2
+        exit 1
+    fi
 
     # Temporarily unlock LUKS drives if inner filesystem UUIDs aren't visible yet
     local missing_dev=0
@@ -223,35 +288,45 @@ do_config() {
             while read -r luks_dev; do
                 [[ -z "$luks_dev" ]] && continue
                 local active_crypt
-                active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}')"
+                active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}' || true)"
                 if [[ -z "$active_crypt" ]]; then
                     local kname mapper
                     kname="$(lsblk -ndo KNAME "$luks_dev")"
                     mapper="${kname}-crypt"
                     echo "[DRY-RUN] Would unlock $luks_dev as /dev/mapper/${mapper}"
                 fi
-            done < <(blkid -t TYPE=crypto_LUKS -o device)
+            done < <(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null || true)
         else
             echo "[INFO] LUKS drives are currently locked; unlocking to inspect inner filesystem UUIDs..."
-            local luks_pass
-            read -rsp "Enter LUKS passphrase: " luks_pass
-            echo
+            local max_attempts=3
+            [[ ! -t 0 ]] && max_attempts=1
+            for (( attempt=1; attempt<=max_attempts; attempt++ )); do
+                local luks_pass
+                read_passphrase
 
-            while read -r luks_dev; do
-                [[ -z "$luks_dev" ]] && continue
-                local active_crypt
-                active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}')"
-                if [[ -z "$active_crypt" ]]; then
-                    local kname mapper
-                    kname="$(lsblk -ndo KNAME "$luks_dev")"
-                    mapper="${kname}-crypt"
-                    echo "Unlocking $luks_dev as /dev/mapper/${mapper}..."
-                    printf '%s' "$luks_pass" | cryptsetup open "$luks_dev" "$mapper" - || true
-                fi
-            done < <(blkid -t TYPE=crypto_LUKS -o device)
+                while read -r luks_dev; do
+                    [[ -z "$luks_dev" ]] && continue
+                    local active_crypt
+                    active_crypt="$(lsblk -nlo NAME,TYPE "$luks_dev" 2>/dev/null | awk '$2=="crypt"{print $1; exit}' || true)"
+                    if [[ -z "$active_crypt" ]]; then
+                        local kname mapper
+                        kname="$(lsblk -ndo KNAME "$luks_dev")"
+                        mapper="${kname}-crypt"
+                        echo "Unlocking $luks_dev as /dev/mapper/${mapper}..."
+                        printf '%s' "$luks_pass" | cryptsetup open "$luks_dev" "$mapper" - || true
+                    fi
+                done < <(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null || true)
 
-            unset luks_pass
-            udevadm settle
+                unset luks_pass
+                udevadm settle
+
+                missing_dev=0
+                for dev in "${fs_devs[@]}"; do
+                    [[ ! -e "$dev" ]] && missing_dev=1 && break
+                done
+                [[ $missing_dev -eq 0 ]] && break
+                [[ $attempt -lt $max_attempts ]] && echo "Try again ($attempt/$max_attempts)..."
+            done
         fi
     fi
 
@@ -270,23 +345,33 @@ do_config() {
             exit 1
         fi
 
-        local pkname
-        pkname="$(lsblk -ndo PKNAME "$fs_dev")"
-        if [[ -z "$pkname" ]]; then
-            echo "Error: Could not find parent device for $fs_dev." >&2
-            exit 1
-        fi
+        local resolved_fs_dev cur_dev parent_dev="" pkname
+        resolved_fs_dev="$(readlink -f "$fs_dev")"
+        cur_dev="$resolved_fs_dev"
+        for _ in 1 2 3 4; do
+            pkname="$(lsblk -ndo PKNAME "$cur_dev" 2>/dev/null | awk 'NR==1{print; exit}' || true)"
+            [[ -z "$pkname" ]] && break
+            cur_dev="/dev/${pkname}"
+            if cryptsetup isLuks "$cur_dev" 2>/dev/null; then
+                parent_dev="$cur_dev"
+                break
+            fi
+        done
 
-        local parent_dev="/dev/${pkname}"
-        if ! cryptsetup isLuks "$parent_dev"; then
-            echo "Error: Parent device $parent_dev ($fs_mnt) is not a LUKS partition." >&2
+        if [[ -z "$parent_dev" ]]; then
+            echo "Error: Could not find a parent LUKS partition for $fs_dev ($resolved_fs_dev)." >&2
             exit 1
         fi
 
         local luks_uuid
         luks_uuid="$(cryptsetup luksUUID "$parent_dev")"
         echo "[INFO] Mapped $fs_mnt -> $parent_dev (LUKS UUID: $luks_uuid)"
-        luks_uuids+=("$luks_uuid")
+
+        local uuid_exists=0
+        for existing_uuid in "${luks_uuids[@]:-}"; do
+            [[ "$existing_uuid" == "$luks_uuid" ]] && uuid_exists=1 && break
+        done
+        [[ $uuid_exists -eq 0 ]] && luks_uuids+=("$luks_uuid")
     done
 
     # Discover /export/* bind mounts and enabled SMB/NFS services
@@ -334,7 +419,7 @@ EOF
         printf '%s\n' "$config_content"
         echo "----------------------------------------"
     else
-        printf '%s\n' "$config_content" > "$CONFIG_FILE"
+        (umask 077 && printf '%s\n' "$config_content" > "$CONFIG_FILE")
         chmod 600 "$CONFIG_FILE"
         echo "[OK] Saved configuration to $CONFIG_FILE:"
         echo "----------------------------------------"
@@ -382,10 +467,11 @@ do_unlock() {
             done
         else
             local unlocked_all=0
-            for attempt in 1 2 3; do
+            local max_attempts=3
+            [[ ! -t 0 ]] && max_attempts=1
+            for (( attempt=1; attempt<=max_attempts; attempt++ )); do
                 local luks_pass
-                read -rsp "Enter LUKS passphrase: " luks_pass
-                echo
+                read_passphrase
 
                 local failed=0
                 for uuid in "${LUKS_UUIDS[@]}"; do
@@ -416,11 +502,11 @@ do_unlock() {
                     unlocked_all=1
                     break
                 fi
-                echo "Try again ($attempt/3)..."
+                [[ $attempt -lt $max_attempts ]] && echo "Try again ($attempt/$max_attempts)..."
             done
 
             if [[ $unlocked_all -ne 1 ]]; then
-                echo "Error: Could not unlock drives after 3 attempts." >&2
+                echo "Error: Could not unlock drives after $max_attempts attempt(s)." >&2
                 exit 1
             fi
         fi
@@ -455,7 +541,12 @@ do_unlock() {
         echo "[DRY-RUN] Would mount MergerFS pool ($MERGERFS_MOUNT) via $mergerfs_unit."
     else
         echo "Mounting MergerFS pool ($MERGERFS_MOUNT)..."
-        systemctl restart "$mergerfs_unit" 2>/dev/null || mount "$MERGERFS_MOUNT"
+        systemctl reset-failed "$mergerfs_unit" 2>/dev/null || true
+        if [[ -f "/etc/systemd/system/${mergerfs_unit}" ]] || systemctl list-unit-files "$mergerfs_unit" &>/dev/null; then
+            systemctl restart "$mergerfs_unit"
+        else
+            mount "$MERGERFS_MOUNT"
+        fi
         echo "[OK] Mounted $MERGERFS_MOUNT."
     fi
 
@@ -529,9 +620,14 @@ do_lock() {
         fi
     done
 
-    # Unmount any /export/* NFS bind mounts backed by the pool
+    # Unmount any /export/* NFS bind mounts backed by the pool (in reverse order)
+    local exports=()
     while read -r exp_mnt; do
-        [[ -z "$exp_mnt" ]] && continue
+        [[ -n "$exp_mnt" ]] && exports+=("$exp_mnt")
+    done < <(get_export_mounts)
+
+    for (( idx=${#exports[@]}-1 ; idx>=0 ; idx-- )); do
+        local exp_mnt="${exports[$idx]}"
         if mountpoint -q "$exp_mnt"; then
             if [[ $DRY_RUN -eq 1 ]]; then
                 echo "[DRY-RUN] Would unmount export bind mount $exp_mnt."
@@ -547,7 +643,7 @@ do_lock() {
         else
             echo "[OK] Export bind mount $exp_mnt is already unmounted."
         fi
-    done < <(get_export_mounts)
+    done
 
     local mergerfs_unit
     mergerfs_unit="$(systemd-escape -p --suffix=mount "$MERGERFS_MOUNT")"
@@ -567,7 +663,8 @@ do_lock() {
         echo "[OK] $MERGERFS_MOUNT is already unmounted."
     fi
 
-    for mnt in "${FS_MOUNTS[@]}"; do
+    for (( idx=${#FS_MOUNTS[@]}-1 ; idx>=0 ; idx-- )); do
+        local mnt="${FS_MOUNTS[$idx]}"
         if mountpoint -q "$mnt"; then
             if [[ $DRY_RUN -eq 1 ]]; then
                 echo "[DRY-RUN] Would unmount $mnt."
@@ -591,7 +688,8 @@ do_lock() {
         sync
     fi
 
-    for uuid in "${LUKS_UUIDS[@]}"; do
+    for (( idx=${#LUKS_UUIDS[@]}-1 ; idx>=0 ; idx-- )); do
+        local uuid="${LUKS_UUIDS[$idx]}"
         local dev="/dev/disk/by-uuid/${uuid}"
         [[ ! -e "$dev" ]] && continue
 
@@ -602,7 +700,11 @@ do_lock() {
                 echo "[DRY-RUN] Would lock /dev/mapper/${mapper}."
             else
                 echo "Locking /dev/mapper/${mapper}..."
-                cryptsetup close "$mapper"
+                if ! cryptsetup close "$mapper"; then
+                    echo "Error: /dev/mapper/${mapper} is busy! Active processes:" >&2
+                    fuser -vm "/dev/mapper/${mapper}" || true
+                    exit 1
+                fi
                 echo "[OK] Locked ${mapper}."
             fi
         else
@@ -624,6 +726,10 @@ do_status() {
     load_config
     echo "=== LUKS Drives ==="
     for uuid in "${LUKS_UUIDS[@]}"; do
+        if [[ ! -e "/dev/disk/by-uuid/${uuid}" ]]; then
+            echo "  [MISSING]  $uuid"
+            continue
+        fi
         local mapper
         mapper="$(get_active_mapper "$uuid")"
         if [[ -n "$mapper" ]]; then
