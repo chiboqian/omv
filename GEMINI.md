@@ -18,6 +18,7 @@ This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script fo
    - Works whether or not the filesystems are in `/etc/fstab`: resolves and mounts `/srv/dev-disk-by-uuid-<FS_UUID>` via `/etc/fstab`, systemd `.mount` units (`/etc/systemd/system/srv-*.mount`), `/etc/openmediavault/config.xml` (`mntent`), or direct `/dev/disk/by-uuid/<FS_UUID>` device mounts.
 
 3. **MergerFS Layer (`MERGERFS_MOUNT`)**
+   - Discovers pool branch paths from `/etc/systemd/system/srv-mergerfs-<pool>.mount` (`Options=branches=...`, `What=`, or `RequiresMountsFor=`) or `/etc/openmediavault/config.xml`.
    - Starts/stops the OMV 8 `openmediavault-mergerfs` systemd mount unit (`srv-mergerfs-<pool>.mount` via `systemd-escape`), resetting any boot-time failed state (`systemctl reset-failed`) and restarting the unit if underlying branch filesystems were newly mounted after boot.
 
 4. **Shared Folders Layer (`EXPORT_MOUNTS` & `SHARE_SERVICES`)**
@@ -27,7 +28,7 @@ This directory contains [`omv-pool.sh`](./omv-pool.sh), a unified bash script fo
      - On `lock`: stops `smbd.service` / `nfs-server.service` before unmounting so open SMB/NFS file handles do not block `umount` with `target is busy`, then starts `smbd.service` / `nfs-server.service` back up after locking so other shares remain active.
 
 5. **Configuration (`/etc/omv-pool.conf`)**
-   - Generated automatically by inspecting `/etc/systemd/system/srv-mergerfs-*.mount` (or `/etc/openmediavault/config.xml`), `/etc/fstab`, and `lsblk`/`cryptsetup luksUUID`.
+   - Generated automatically by inspecting `/etc/systemd/system/srv-mergerfs-*.mount` (or `/etc/openmediavault/config.xml`), `/etc/fstab` / systemd `.mount` units / `config.xml`, and `lsblk -s` / sysfs slaves / `cryptsetup luksUUID`.
    - Stored with `0600` permissions at `/etc/omv-pool.conf`.
 
 ---
@@ -41,10 +42,11 @@ sudo ./omv-pool.sh config <mergerfs-pool-name>
 # 2. Unlock LUKS drives (prompts once), mount filesystems + MergerFS + exports, and start SMB/NFS
 sudo ./omv-pool.sh unlock
 
-# 3. Check current LUKS, filesystem, MergerFS, export bind mount, and SMB/NFS status
+# 3. Check current LUKS, filesystem, MergerFS, export bind mount, and SMB/NFS status (-s, --status, or status)
 sudo ./omv-pool.sh status
+sudo ./omv-pool.sh -s
 
-# 4. Stop SMB/NFS, unmount exports + MergerFS + filesystems, and lock LUKS drives
+# 4. Stop SMB/NFS, unmount exports + MergerFS + filesystems, lock LUKS drives, and restart SMB/NFS
 sudo ./omv-pool.sh lock
 
 # 5. Preview any action without making changes (-n or --dry-run)
